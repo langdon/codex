@@ -89,10 +89,10 @@ use codex_protocol::openai_models::ModelUpgrade;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::AgentMessageDeltaEvent;
 use codex_protocol::protocol::AgentMessageEvent;
+use codex_protocol::protocol::AgentSpawnMode;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CollabAgentSpawnEndEvent;
-use codex_protocol::protocol::CollabAgentSpawnMode;
 use codex_protocol::protocol::CollabCloseEndEvent;
 use codex_protocol::protocol::CollabWaitingEndEvent;
 use codex_protocol::protocol::ErrorEvent;
@@ -614,7 +614,7 @@ struct SubagentInfo {
     ordinal: i32,
     name: String,
     prompt_preview: String,
-    spawn_mode: CollabAgentSpawnMode,
+    spawn_mode: AgentSpawnMode,
     status: AgentStatus,
     spawned_at: Instant,
     started_at: Option<Instant>,
@@ -627,12 +627,7 @@ struct SubagentInfo {
 }
 
 impl SubagentInfo {
-    fn new(
-        ordinal: i32,
-        name: String,
-        prompt_preview: String,
-        spawn_mode: CollabAgentSpawnMode,
-    ) -> Self {
+    fn new(ordinal: i32, name: String, prompt_preview: String, spawn_mode: AgentSpawnMode) -> Self {
         let now = Instant::now();
         Self {
             ordinal,
@@ -656,7 +651,7 @@ impl SubagentInfo {
     }
 
     fn is_watchdog(&self) -> bool {
-        self.spawn_mode == CollabAgentSpawnMode::Watchdog
+        self.spawn_mode == AgentSpawnMode::Watchdog
     }
 
     fn is_visible_in_panel(&self) -> bool {
@@ -739,7 +734,7 @@ impl SubagentRegistry {
 
     fn on_spawn_end(&mut self, event: &CollabAgentSpawnEndEvent) -> Option<Box<dyn HistoryCell>> {
         let new_thread_id = event.new_thread_id?;
-        if event.spawn_mode == CollabAgentSpawnMode::Watchdog {
+        if event.spawn_mode == AgentSpawnMode::Watchdog {
             self.prune_superseded_watchdogs(new_thread_id);
         }
         if self.contains(new_thread_id) {
@@ -784,7 +779,7 @@ impl SubagentRegistry {
             .agents
             .iter()
             .filter_map(|(thread_id, info)| {
-                (info.spawn_mode == CollabAgentSpawnMode::Watchdog && *thread_id != keep_thread_id)
+                (info.spawn_mode == AgentSpawnMode::Watchdog && *thread_id != keep_thread_id)
                     .then_some(*thread_id)
             })
             .collect();
@@ -6094,7 +6089,7 @@ mod tests {
             1,
             "watchdog-agent".to_string(),
             "watchdog idle".to_string(),
-            CollabAgentSpawnMode::Watchdog,
+            AgentSpawnMode::Watchdog,
         );
         info.status = AgentStatus::PendingInit;
         info.latest_preview = "watchdog idle".to_string();

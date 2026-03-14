@@ -412,7 +412,9 @@ enabled = true
         "custom".to_string(),
         crate::config::AgentRoleConfig {
             description: None,
+            model: None,
             config_file: Some(role_path),
+            spawn_mode: None,
             nickname_candidates: None,
         },
     );

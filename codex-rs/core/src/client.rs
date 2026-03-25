@@ -32,6 +32,7 @@ use std::sync::atomic::Ordering;
 
 use crate::api_bridge::CoreAuthProvider;
 use crate::api_bridge::auth_provider_from_auth;
+use crate::api_bridge::inline_image_request_limit_bad_request_observation;
 use crate::api_bridge::map_api_error;
 use crate::auth::UnauthorizedRecovery;
 use crate::auth_env_telemetry::AuthEnvTelemetry;
@@ -121,6 +122,8 @@ const RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE: &str = "responses_websockets=20
 const RESPONSES_ENDPOINT: &str = "/responses";
 const RESPONSES_COMPACT_ENDPOINT: &str = "/responses/compact";
 const MEMORIES_SUMMARIZE_ENDPOINT: &str = "/memories/trace_summarize";
+const INLINE_IMAGE_REQUEST_LIMIT_METRIC_NAME: &str = "codex.responses.inline_image_limit";
+const INLINE_IMAGE_REQUEST_LIMIT_OUTCOME_UPSTREAM_REJECTED: &str = "upstream_rejected";
 #[cfg(test)]
 pub(crate) const WEBSOCKET_CONNECT_TIMEOUT: Duration =
     Duration::from_millis(crate::model_provider_info::DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS);
@@ -399,7 +402,12 @@ impl ModelClient {
         client
             .compact_input(&payload, extra_headers)
             .await
-            .map_err(map_api_error)
+            .map_err(|err| {
+                ModelClientSession::map_api_error_and_record_upstream_inline_image_request_limit_observation(
+                    session_telemetry,
+                    err,
+                )
+            })
     }
 
     /// Builds memory summaries for each provided normalized raw memory.
@@ -671,6 +679,53 @@ impl Drop for ModelClientSession {
 }
 
 impl ModelClientSession {
+    fn map_api_error_and_record_upstream_inline_image_request_limit_observation(
+        session_telemetry: &SessionTelemetry,
+        err: ApiError,
+    ) -> CodexErr {
+        let mapped = map_api_error(err);
+        Self::record_upstream_inline_image_request_limit_observation(session_telemetry, &mapped);
+        mapped
+    }
+
+    fn record_upstream_inline_image_request_limit_observation(
+        session_telemetry: &SessionTelemetry,
+        err: &CodexErr,
+    ) {
+        let CodexErr::InvalidRequest(message) = err else {
+            return;
+        };
+        let Some(observation) = inline_image_request_limit_bad_request_observation(message) else {
+            return;
+        };
+        session_telemetry.counter(
+            INLINE_IMAGE_REQUEST_LIMIT_METRIC_NAME,
+            /*inc*/ 1,
+            &[
+                (
+                    "outcome",
+                    INLINE_IMAGE_REQUEST_LIMIT_OUTCOME_UPSTREAM_REJECTED,
+                ),
+                (
+                    "bytes_exceeded",
+                    if observation.bytes_exceeded {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                ),
+                (
+                    "images_exceeded",
+                    if observation.images_exceeded {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                ),
+            ],
+        );
+    }
+
     fn reset_websocket_session(&mut self) {
         self.websocket_session.connection = None;
         self.websocket_session.last_request = None;
@@ -1072,7 +1127,14 @@ impl ModelClientSession {
                     );
                     continue;
                 }
-                Err(err) => return Err(map_api_error(err)),
+                Err(err) => {
+                    return Err(
+                        Self::map_api_error_and_record_upstream_inline_image_request_limit_observation(
+                            session_telemetry,
+                            err,
+                        ),
+                    );
+                }
             }
         }
     }
@@ -1185,7 +1247,12 @@ impl ModelClientSession {
             let stream_result = stream_result
                 .stream_request(ws_request, self.websocket_session.connection_reused())
                 .await
-                .map_err(map_api_error)?;
+                .map_err(|err| {
+                    Self::map_api_error_and_record_upstream_inline_image_request_limit_observation(
+                        session_telemetry,
+                        err,
+                    )
+                })?;
             let (stream, last_request_rx) =
                 map_response_stream(stream_result, session_telemetry.clone());
             self.websocket_session.last_response_rx = Some(last_request_rx);
@@ -1468,7 +1535,10 @@ where
                     }
                 }
                 Err(err) => {
-                    let mapped = map_api_error(err);
+                    let mapped = ModelClientSession::map_api_error_and_record_upstream_inline_image_request_limit_observation(
+                        &session_telemetry,
+                        err,
+                    );
                     if !logged_error {
                         session_telemetry.see_event_completed_failed(&mapped);
                         logged_error = true;

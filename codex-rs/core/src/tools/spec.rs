@@ -1113,7 +1113,7 @@ fn create_spawn_agent_tool(config: &ToolsConfig) -> ToolSpec {
             "fork_context".to_string(),
             JsonSchema::Boolean {
                 description: Some(
-                    "When true, fork the current thread history into the new agent before sending the initial prompt. This must be used when you want the new agent to have exactly the same context as you."
+                    "When true, fork the current thread history into the new agent before sending the initial prompt. This must be used when you want the new agent to have exactly the same context as you. Forked agents always inherit the parent thread's model and reasoning effort, ignoring any child `model` or `reasoning_effort` overrides."
                         .to_string(),
                 ),
             },
@@ -1122,7 +1122,7 @@ fn create_spawn_agent_tool(config: &ToolsConfig) -> ToolSpec {
             "model".to_string(),
             JsonSchema::String {
                 description: Some(
-                    "Optional model override for the new agent. Replaces the inherited model."
+                    "Optional model override for the new agent. Replaces the inherited model unless `fork_context` is true."
                         .to_string(),
                 ),
             },
@@ -1131,21 +1131,9 @@ fn create_spawn_agent_tool(config: &ToolsConfig) -> ToolSpec {
             "reasoning_effort".to_string(),
             JsonSchema::String {
                 description: Some(
-                    "Optional reasoning effort override for the new agent. Replaces the inherited reasoning effort."
+                    "Optional reasoning effort override for the new agent. Replaces the inherited reasoning effort unless `fork_context` is true."
                         .to_string(),
                 ),
-            },
-        ),
-        (
-            "spawn_mode".to_string(),
-            JsonSchema::String {
-                description: Some(if config.agent_watchdog {
-                    "Optional spawn behavior override: `spawn`, `fork`, or `watchdog`. Roles may override the omitted default. `watchdog` creates an idle-time check-in handle rather than a conversational worker."
-                        .to_string()
-                } else {
-                    "Optional spawn behavior override: `spawn` or `fork`. Roles may override the omitted default."
-                        .to_string()
-                }),
             },
         ),
     ]);

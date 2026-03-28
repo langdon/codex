@@ -2,7 +2,7 @@
 // Unified entry point for the Codex CLI.
 
 import { spawn } from "node:child_process";
-import { existsSync } from "fs";
+import { existsSync, readFileSync } from "fs";
 import { createRequire } from "node:module";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -177,6 +177,16 @@ const child = spawn(binaryPath, process.argv.slice(2), {
   env,
 });
 
+const inboxPath =
+  process.env.CODEX_INBOX_FILE ?? `/tmp/codex-inbox-${process.pid}.md`;
+
+function logDebug(message) {
+  if (process.env.CODEX_DEBUG_SIGNALS === "1") {
+    // eslint-disable-next-line no-console
+    console.error(`[codex signal] ${message}`);
+  }
+}
+
 child.on("error", (err) => {
   // Typically triggered when the binary is missing or not executable.
   // Re-throwing here will terminate the parent with a non-zero exit code
@@ -203,6 +213,28 @@ const forwardSignal = (signal) => {
 
 ["SIGINT", "SIGTERM", "SIGHUP"].forEach((sig) => {
   process.on(sig, () => forwardSignal(sig));
+});
+
+process.on("SIGUSR1", () => {
+  if (!existsSync(inboxPath)) {
+    logDebug(`SIGUSR1 received but inbox file not found: ${inboxPath}`);
+    return;
+  }
+
+  let inboxText = "";
+  try {
+    inboxText = readFileSync(inboxPath, "utf8");
+  } catch {
+    logDebug(`SIGUSR1 received but inbox file could not be read: ${inboxPath}`);
+    return;
+  }
+
+  if (!inboxText.trim()) {
+    logDebug(`SIGUSR1 received with empty inbox file: ${inboxPath}`);
+    return;
+  }
+
+  forwardSignal("SIGUSR1");
 });
 
 // When the child exits, mirror its termination reason in the parent so that

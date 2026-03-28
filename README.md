@@ -28,6 +28,11 @@ brew install --cask codex
 
 Then simply run `codex` to get started.
 
+On Linux and macOS, you can inject a message into a running Codex session by writing it to
+`/tmp/codex-inbox-<pid>.md` (or the path in `CODEX_INBOX_FILE`) and sending `SIGUSR1` to the
+Codex process. Codex reads the file at the next safe point, injects it as a new user turn, and
+deletes the inbox file.
+
 <details>
 <summary>You can also go to the <a href="https://github.com/openai/codex/releases/latest">latest GitHub Release</a> and download the appropriate binary for your platform.</summary>
 

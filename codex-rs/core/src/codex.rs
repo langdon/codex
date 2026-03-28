@@ -4,7 +4,9 @@ use std::fmt::Debug;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use crate::AuthManager;
 use crate::CodexAuth;
@@ -164,6 +166,8 @@ use crate::client_common::ResponseEvent;
 use crate::codex_thread::ThreadConfigSnapshot;
 use crate::compact::collect_user_messages;
 use crate::config::Config;
+use crate::config::ConfigOverrides;
+use crate::config::ConfigToml;
 use crate::config::Constrained;
 use crate::config::ConstraintResult;
 use crate::config::GhostSnapshotConfig;
@@ -421,9 +425,16 @@ pub(crate) struct CodexSpawnArgs {
 
 pub(crate) const INITIAL_SUBMIT_ID: &str = "";
 pub(crate) const SUBMISSION_CHANNEL_CAPACITY: usize = 512;
+const CODEX_INBOX_FILE_ENV_VAR: &str = "CODEX_INBOX_FILE";
 const CYBER_VERIFY_URL: &str = "https://chatgpt.com/cyber";
 const CYBER_SAFETY_URL: &str = "https://developers.openai.com/codex/concepts/cyber-safety";
 const DIRECT_APP_TOOL_EXPOSURE_THRESHOLD: usize = 100;
+
+fn codex_inbox_path() -> PathBuf {
+    std::env::var_os(CODEX_INBOX_FILE_ENV_VAR)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("/tmp/codex-inbox-{}.md", std::process::id())))
+}
 
 impl Codex {
     /// Spawn a new [`Codex`] and initialize the session.
@@ -810,7 +821,10 @@ pub(crate) struct Session {
     pub(crate) guardian_review_session: GuardianReviewSessionManager,
     pub(crate) services: SessionServices,
     js_repl: Arc<JsReplHandle>,
+    pending_sigusr2_reload: AtomicBool,
     next_internal_sub_id: AtomicU64,
+    #[cfg(unix)]
+    sigusr1_pending: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Debug)]
@@ -1239,6 +1253,28 @@ impl Session {
         } else {
             Some(beta_features_header)
         }
+    }
+
+    fn spawn_sigusr2_listener(sess: &Arc<Self>) {
+        #[cfg(unix)]
+        {
+            let sess = Arc::clone(sess);
+            tokio::spawn(async move {
+                use tokio::signal::unix::SignalKind;
+                use tokio::signal::unix::signal;
+
+                let Ok(mut signal_stream) = signal(SignalKind::user_defined2()) else {
+                    warn!("failed to register SIGUSR2 handler for config reload");
+                    return;
+                };
+
+                while signal_stream.recv().await.is_some() {
+                    sess.pending_sigusr2_reload.store(true, Ordering::Release);
+                }
+            });
+        }
+        #[cfg(not(unix))]
+        let _ = sess;
     }
 
     async fn start_managed_network_proxy(
@@ -1906,6 +1942,8 @@ impl Session {
         ));
         let (out_of_band_elicitation_paused, _out_of_band_elicitation_paused_rx) =
             watch::channel(false);
+        #[cfg(unix)]
+        let sigusr1_pending = Arc::new(AtomicBool::new(false));
 
         let sess = Arc::new(Session {
             conversation_id,
@@ -1921,8 +1959,14 @@ impl Session {
             guardian_review_session: GuardianReviewSessionManager::default(),
             services,
             js_repl,
+            pending_sigusr2_reload: AtomicBool::new(false),
             next_internal_sub_id: AtomicU64::new(0),
+            #[cfg(unix)]
+            sigusr1_pending: Arc::clone(&sigusr1_pending),
         });
+        #[cfg(unix)]
+        sess.spawn_sigusr1_listener(sigusr1_pending);
+        Session::spawn_sigusr2_listener(&sess);
         if let Some(network_policy_decider_session) = network_policy_decider_session {
             let mut guard = network_policy_decider_session.write().await;
             *guard = Arc::downgrade(&sess);
@@ -2573,13 +2617,104 @@ impl Session {
         };
 
         let mut state = self.state.lock().await;
-        let mut config = (*state.session_configuration.original_config_do_not_use).clone();
+        let current_config = (*state.session_configuration.original_config_do_not_use).clone();
+        let mut config = current_config.clone();
         config.config_layer_stack = config
             .config_layer_stack
             .with_user_config(&config_toml_path, user_config);
-        state.session_configuration.original_config_do_not_use = Arc::new(config);
+
+        let merged_toml = config.config_layer_stack.effective_config();
+        let config_toml: ConfigToml = match merged_toml.try_into() {
+            Ok(config_toml) => config_toml,
+            Err(err) => {
+                warn!("failed to deserialize merged config while reloading layer: {err}");
+                return;
+            }
+        };
+
+        let reloaded_config = match Config::load_config_with_layer_stack(
+            config_toml,
+            ConfigOverrides {
+                cwd: Some(current_config.cwd.to_path_buf()),
+                codex_self_exe: current_config.codex_self_exe.clone(),
+                codex_linux_sandbox_exe: current_config.codex_linux_sandbox_exe.clone(),
+                main_execve_wrapper_exe: current_config.main_execve_wrapper_exe.clone(),
+                js_repl_node_path: current_config.js_repl_node_path.clone(),
+                js_repl_node_module_dirs: Some(current_config.js_repl_node_module_dirs.clone()),
+                zsh_path: current_config.zsh_path.clone(),
+                ephemeral: Some(current_config.ephemeral),
+                ..ConfigOverrides::default()
+            },
+            current_config.codex_home.clone(),
+            config.config_layer_stack.clone(),
+        ) {
+            Ok(reloaded_config) => reloaded_config,
+            Err(err) => {
+                warn!("failed to rebuild config while reloading layer: {err}");
+                return;
+            }
+        };
+
+        let previous_model = state
+            .session_configuration
+            .collaboration_mode
+            .model()
+            .to_string();
+        let next_model = reloaded_config
+            .model
+            .clone()
+            .unwrap_or_else(|| previous_model.clone());
+        state.session_configuration.provider = reloaded_config.model_provider.clone();
+        state.session_configuration.collaboration_mode =
+            state.session_configuration.collaboration_mode.with_updates(
+                Some(next_model),
+                reloaded_config.model_reasoning_effort,
+                /*developer_instructions*/ None,
+            );
+        state.session_configuration.model_reasoning_summary =
+            reloaded_config.model_reasoning_summary;
+
+        if state.session_configuration.approval_policy.value()
+            != reloaded_config.permissions.approval_policy.value()
+        {
+            warn!(
+                "SIGUSR2 config reload ignored approval policy change for active session (restart required)"
+            );
+        }
+        if state.session_configuration.sandbox_policy.get()
+            != reloaded_config.permissions.sandbox_policy.get()
+        {
+            warn!(
+                "SIGUSR2 config reload ignored sandbox policy change for active session (restart required)"
+            );
+        }
+        if state.session_configuration.cwd.as_path() != reloaded_config.cwd.as_path() {
+            warn!("SIGUSR2 config reload ignored cwd change for active session (restart required)");
+        }
+
+        state.session_configuration.original_config_do_not_use = Arc::new(reloaded_config);
         self.services.skills_manager.clear_cache();
         self.services.plugins_manager.clear_cache();
+    }
+
+    async fn maybe_reload_config_from_sigusr2(&self) {
+        if !self.pending_sigusr2_reload.swap(false, Ordering::AcqRel) {
+            return;
+        }
+
+        self.reload_user_config_layer().await;
+        let config_layer_stack = {
+            let state = self.state.lock().await;
+            state
+                .session_configuration
+                .original_config_do_not_use
+                .config_layer_stack
+                .clone()
+        };
+        if let Err(err) = self.services.exec_policy.reload(&config_layer_stack).await {
+            warn!("failed to reload rules from SIGUSR2: {err}");
+        }
+        println!("[config reloaded]");
     }
 
     pub(crate) async fn new_default_turn_with_sub_id(&self, sub_id: String) -> Arc<TurnContext> {
@@ -4009,6 +4144,68 @@ impl Session {
         }
     }
 
+    #[cfg(unix)]
+    fn spawn_sigusr1_listener(&self, sigusr1_pending: Arc<AtomicBool>) {
+        tokio::spawn(async move {
+            let Ok(mut sigusr1) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+            else {
+                warn!("failed to register SIGUSR1 handler");
+                return;
+            };
+
+            while sigusr1.recv().await.is_some() {
+                sigusr1_pending.store(true, Ordering::Release);
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    async fn maybe_inject_sigusr1_inbox(&self) {
+        if !self.sigusr1_pending.swap(false, Ordering::AcqRel) {
+            return;
+        }
+
+        let inbox_path = codex_inbox_path();
+        let inbox_contents = match tokio::fs::read_to_string(&inbox_path).await {
+            Ok(contents) => contents,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+            Err(err) => {
+                warn!(
+                    "failed reading SIGUSR1 inbox file {}: {err}",
+                    inbox_path.display()
+                );
+                return;
+            }
+        };
+
+        if inbox_contents.is_empty() {
+            return;
+        }
+
+        if let Err(err) = tokio::fs::remove_file(&inbox_path).await
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(
+                "failed deleting SIGUSR1 inbox file {}: {err}",
+                inbox_path.display()
+            );
+        }
+
+        if let Err(err) = self
+            .steer_input(
+                vec![UserInput::Text {
+                    text: inbox_contents,
+                    text_elements: Vec::new(),
+                }],
+                None,
+            )
+            .await
+        {
+            warn!("failed to inject SIGUSR1 inbox message: {err:?}");
+        }
+    }
+
     pub async fn list_resources(
         &self,
         server: &str,
@@ -4245,6 +4442,7 @@ impl Session {
 async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiver<Submission>) {
     // To break out of this loop, send Op::Shutdown.
     while let Ok(sub) = rx_sub.recv().await {
+        sess.maybe_reload_config_from_sigusr2().await;
         debug!(?sub, "Submission");
         let dispatch_span = submission_dispatch_span(&sub);
         let should_exit = async {
@@ -5791,9 +5989,13 @@ pub(crate) async fn run_turn(
         prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
 
     loop {
+        #[cfg(unix)]
+        sess.maybe_inject_sigusr1_inbox().await;
+
         if run_pending_session_start_hooks(&sess, &turn_context).await {
             break;
         }
+        sess.maybe_reload_config_from_sigusr2().await;
 
         // Note that pending_input would be something like a message the user
         // submitted through the UI while the model was running. Though the UI

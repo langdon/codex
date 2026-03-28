@@ -2,7 +2,7 @@
 // Unified entry point for the Codex CLI.
 
 import { spawn } from "node:child_process";
-import { existsSync } from "fs";
+import { existsSync, statSync } from "fs";
 import { createRequire } from "node:module";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -177,6 +177,9 @@ const child = spawn(binaryPath, process.argv.slice(2), {
   env,
 });
 
+const inboxPath =
+  process.env.CODEX_INBOX_FILE ?? `/tmp/codex-inbox-${process.pid}.md`;
+
 child.on("error", (err) => {
   // Typically triggered when the binary is missing or not executable.
   // Re-throwing here will terminate the parent with a non-zero exit code
@@ -204,6 +207,32 @@ const forwardSignal = (signal) => {
 ["SIGINT", "SIGTERM", "SIGHUP"].forEach((sig) => {
   process.on(sig, () => forwardSignal(sig));
 });
+
+if (process.platform !== "win32") {
+  process.on("SIGUSR1", () => {
+    if (!existsSync(inboxPath)) {
+      return;
+    }
+
+    try {
+      if (statSync(inboxPath).size === 0) {
+        return;
+      }
+    } catch {
+      return;
+    }
+
+    forwardSignal("SIGUSR1");
+  });
+}
+
+// SIGHUP is already used to forward terminal hangups to the child.
+// SIGUSR2 is reserved for live config/rules reload.
+if (process.platform !== "win32") {
+  process.on("SIGUSR2", () => {
+    forwardSignal("SIGUSR2");
+  });
+}
 
 // When the child exits, mirror its termination reason in the parent so that
 // shell scripts and other tooling observe the correct exit status.

@@ -223,6 +223,18 @@ impl ExecPolicyManager {
         self.policy.load_full()
     }
 
+    pub(crate) async fn reload(
+        &self,
+        config_stack: &ConfigLayerStack,
+    ) -> Result<(), ExecPolicyError> {
+        let (policy, warning) = load_exec_policy_with_warning(config_stack).await?;
+        if let Some(err) = warning.as_ref() {
+            tracing::warn!("failed to parse rules while reloading: {err}");
+        }
+        self.policy.store(Arc::new(policy));
+        Ok(())
+    }
+
     pub(crate) async fn create_exec_approval_requirement_for_command(
         &self,
         req: ExecApprovalRequest<'_>,

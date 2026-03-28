@@ -4,7 +4,9 @@ use std::fmt::Debug;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use crate::AuthManager;
 use crate::CodexAuth;
@@ -421,9 +423,16 @@ pub(crate) struct CodexSpawnArgs {
 
 pub(crate) const INITIAL_SUBMIT_ID: &str = "";
 pub(crate) const SUBMISSION_CHANNEL_CAPACITY: usize = 512;
+const CODEX_INBOX_FILE_ENV_VAR: &str = "CODEX_INBOX_FILE";
 const CYBER_VERIFY_URL: &str = "https://chatgpt.com/cyber";
 const CYBER_SAFETY_URL: &str = "https://developers.openai.com/codex/concepts/cyber-safety";
 const DIRECT_APP_TOOL_EXPOSURE_THRESHOLD: usize = 100;
+
+fn codex_inbox_path() -> PathBuf {
+    std::env::var_os(CODEX_INBOX_FILE_ENV_VAR)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("/tmp/codex-inbox-{}.md", std::process::id())))
+}
 
 impl Codex {
     /// Spawn a new [`Codex`] and initialize the session.
@@ -811,6 +820,8 @@ pub(crate) struct Session {
     pub(crate) services: SessionServices,
     js_repl: Arc<JsReplHandle>,
     next_internal_sub_id: AtomicU64,
+    #[cfg(unix)]
+    sigusr1_pending: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Debug)]
@@ -1906,6 +1917,8 @@ impl Session {
         ));
         let (out_of_band_elicitation_paused, _out_of_band_elicitation_paused_rx) =
             watch::channel(false);
+        #[cfg(unix)]
+        let sigusr1_pending = Arc::new(AtomicBool::new(false));
 
         let sess = Arc::new(Session {
             conversation_id,
@@ -1922,7 +1935,11 @@ impl Session {
             services,
             js_repl,
             next_internal_sub_id: AtomicU64::new(0),
+            #[cfg(unix)]
+            sigusr1_pending: Arc::clone(&sigusr1_pending),
         });
+        #[cfg(unix)]
+        sess.spawn_sigusr1_listener(sigusr1_pending);
         if let Some(network_policy_decider_session) = network_policy_decider_session {
             let mut guard = network_policy_decider_session.write().await;
             *guard = Arc::downgrade(&sess);
@@ -4009,6 +4026,68 @@ impl Session {
         }
     }
 
+    #[cfg(unix)]
+    fn spawn_sigusr1_listener(&self, sigusr1_pending: Arc<AtomicBool>) {
+        tokio::spawn(async move {
+            let Ok(mut sigusr1) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+            else {
+                warn!("failed to register SIGUSR1 handler");
+                return;
+            };
+
+            while sigusr1.recv().await.is_some() {
+                sigusr1_pending.store(true, Ordering::Release);
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    async fn maybe_inject_sigusr1_inbox(&self) {
+        if !self.sigusr1_pending.swap(false, Ordering::AcqRel) {
+            return;
+        }
+
+        let inbox_path = codex_inbox_path();
+        let inbox_contents = match tokio::fs::read_to_string(&inbox_path).await {
+            Ok(contents) => contents,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+            Err(err) => {
+                warn!(
+                    "failed reading SIGUSR1 inbox file {}: {err}",
+                    inbox_path.display()
+                );
+                return;
+            }
+        };
+
+        if inbox_contents.is_empty() {
+            return;
+        }
+
+        if let Err(err) = tokio::fs::remove_file(&inbox_path).await
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(
+                "failed deleting SIGUSR1 inbox file {}: {err}",
+                inbox_path.display()
+            );
+        }
+
+        if let Err(err) = self
+            .steer_input(
+                vec![UserInput::Text {
+                    text: inbox_contents,
+                    text_elements: Vec::new(),
+                }],
+                None,
+            )
+            .await
+        {
+            warn!("failed to inject SIGUSR1 inbox message: {err:?}");
+        }
+    }
+
     pub async fn list_resources(
         &self,
         server: &str,
@@ -5791,6 +5870,9 @@ pub(crate) async fn run_turn(
         prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
 
     loop {
+        #[cfg(unix)]
+        sess.maybe_inject_sigusr1_inbox().await;
+
         if run_pending_session_start_hooks(&sess, &turn_context).await {
             break;
         }

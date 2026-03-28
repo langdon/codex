@@ -28,6 +28,10 @@ brew install --cask codex
 
 Then simply run `codex` to get started.
 
+Codex also supports operator instruction injection for running sessions on Unix:
+write instructions to `CODEX_INBOX_FILE` (or `/tmp/codex-inbox-<pid>.md` by default) and send
+`SIGUSR1` to the running `codex` process.
+
 <details>
 <summary>You can also go to the <a href="https://github.com/openai/codex/releases/latest">latest GitHub Release</a> and download the appropriate binary for your platform.</summary>
 

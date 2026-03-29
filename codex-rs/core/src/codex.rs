@@ -421,6 +421,7 @@ pub(crate) struct CodexSpawnArgs {
 
 pub(crate) const INITIAL_SUBMIT_ID: &str = "";
 pub(crate) const SUBMISSION_CHANNEL_CAPACITY: usize = 512;
+const CODEX_INBOX_DIR_ENV_VAR: &str = "CODEX_INBOX_DIR";
 const CYBER_VERIFY_URL: &str = "https://chatgpt.com/cyber";
 const CYBER_SAFETY_URL: &str = "https://developers.openai.com/codex/concepts/cyber-safety";
 const DIRECT_APP_TOOL_EXPOSURE_THRESHOLD: usize = 100;
@@ -676,6 +677,7 @@ impl Codex {
             session,
             session_loop_termination: session_loop_termination_from_handle(session_loop_handle),
         };
+        spawn_sigusr1_listener(codex.tx_sub.clone());
 
         #[allow(deprecated)]
         Ok(CodexSpawnOk {
@@ -4239,6 +4241,131 @@ impl Session {
             .lock()
             .await
             .cancel();
+    }
+}
+
+fn codex_inbox_dir() -> PathBuf {
+    std::env::var_os(CODEX_INBOX_DIR_ENV_VAR)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("/tmp/codex-inbox-{}", std::process::id())))
+}
+
+#[cfg(unix)]
+fn spawn_sigusr1_listener(tx_sub: Sender<Submission>) {
+    tokio::spawn(async move {
+        use notify::EventKind;
+        use notify::RecursiveMode;
+        use notify::Watcher;
+        use tokio::signal::unix::SignalKind;
+
+        let inbox = codex_inbox_dir();
+        for sub in &["new", "cur", "tmp"] {
+            tokio::fs::create_dir_all(inbox.join(sub)).await.ok();
+        }
+        if let Ok(mut entries) = tokio::fs::read_dir(inbox.join("cur")).await {
+            while let Some(entry) = entries.next_entry().await.ok().flatten() {
+                let name = entry.file_name();
+                let s = name.to_string_lossy();
+                if !s.ends_with(".done") {
+                    warn!("SIGUSR1: stranded message in cur/ from previous crash: {s}");
+                }
+            }
+        }
+
+        let (notify_tx, mut notify_rx) = tokio::sync::mpsc::channel(32);
+        let mut watcher = match notify::recommended_watcher(move |res| {
+            if let Ok(event) = res {
+                let _ = notify_tx.blocking_send(event);
+            }
+        }) {
+            Ok(watcher) => watcher,
+            Err(err) => {
+                warn!("SIGUSR1: failed to initialize inbox watcher: {err}");
+                return;
+            }
+        };
+        if let Err(err) = watcher.watch(&inbox.join("new"), RecursiveMode::NonRecursive) {
+            warn!("SIGUSR1: failed to watch inbox/new: {err}");
+            return;
+        }
+
+        let mut sigusr1 = match tokio::signal::unix::signal(SignalKind::user_defined1()) {
+            Ok(sigusr1) => sigusr1,
+            Err(err) => {
+                warn!("SIGUSR1: failed to initialize signal listener: {err}");
+                return;
+            }
+        };
+
+        loop {
+            tokio::select! {
+                maybe_event = notify_rx.recv() => {
+                    let Some(event) = maybe_event else {
+                        warn!("SIGUSR1: inbox watcher channel closed");
+                        return;
+                    };
+                    if matches!(event.kind, EventKind::Create(_)) {
+                        process_inbox_new(&inbox, &tx_sub).await;
+                    }
+                }
+                maybe_signal = sigusr1.recv() => {
+                    if maybe_signal.is_none() {
+                        warn!("SIGUSR1: signal stream ended");
+                        return;
+                    }
+                    process_inbox_new(&inbox, &tx_sub).await;
+                }
+            }
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_sigusr1_listener(_tx_sub: Sender<Submission>) {}
+
+async fn process_inbox_new(inbox: &Path, tx_sub: &Sender<Submission>) {
+    let new_dir = inbox.join("new");
+    let cur_dir = inbox.join("cur");
+    let mut entries = match tokio::fs::read_dir(&new_dir).await {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    while let Some(entry) = entries.next_entry().await.ok().flatten() {
+        let new_path = entry.path();
+        if !new_path.is_file() {
+            continue;
+        }
+        let fname = entry.file_name();
+        let cur_path = cur_dir.join(&fname);
+        if tokio::fs::rename(&new_path, &cur_path).await.is_err() {
+            continue;
+        }
+        let contents = match tokio::fs::read_to_string(&cur_path).await {
+            Ok(contents) => contents,
+            Err(_) => continue,
+        };
+        if contents.trim().is_empty() {
+            tokio::fs::remove_file(&cur_path).await.ok();
+            continue;
+        }
+        let sub = Submission {
+            id: Uuid::now_v7().to_string(),
+            op: Op::UserInput {
+                items: vec![UserInput::Text {
+                    text: contents,
+                    text_elements: Vec::new(),
+                }],
+                final_output_json_schema: None,
+            },
+            trace: None,
+        };
+        if tx_sub.send(sub).await.is_err() {
+            warn!("SIGUSR1: submission channel closed");
+            return;
+        }
+        let done_name = format!("{}.done", fname.to_string_lossy());
+        let done_path = cur_dir.join(done_name);
+        tokio::fs::rename(&cur_path, &done_path).await.ok();
     }
 }
 

@@ -4273,10 +4273,15 @@ fn spawn_sigusr1_listener(tx_sub: Sender<Submission>) {
         }
 
         let (notify_tx, mut notify_rx) = tokio::sync::mpsc::channel(32);
-        let mut watcher = match notify::recommended_watcher(move |res| {
-            if let Ok(event) = res {
-                let _ = notify_tx.blocking_send(event);
+        let mut watcher = match notify::recommended_watcher(move |res| match res {
+            Ok(event) => {
+                if matches!(event.kind, EventKind::Create(_))
+                    && notify_tx.blocking_send(()).is_err()
+                {
+                    warn!("SIGUSR1: inbox watcher channel closed");
+                }
             }
+            Err(err) => warn!("SIGUSR1: inbox watcher event error: {err}"),
         }) {
             Ok(watcher) => watcher,
             Err(err) => {
@@ -4297,16 +4302,16 @@ fn spawn_sigusr1_listener(tx_sub: Sender<Submission>) {
             }
         };
 
+        process_inbox_new(&inbox, &tx_sub).await;
+
         loop {
             tokio::select! {
                 maybe_event = notify_rx.recv() => {
-                    let Some(event) = maybe_event else {
+                    let Some(()) = maybe_event else {
                         warn!("SIGUSR1: inbox watcher channel closed");
                         return;
                     };
-                    if matches!(event.kind, EventKind::Create(_)) {
-                        process_inbox_new(&inbox, &tx_sub).await;
-                    }
+                    process_inbox_new(&inbox, &tx_sub).await;
                 }
                 maybe_signal = sigusr1.recv() => {
                     if maybe_signal.is_none() {
@@ -4332,7 +4337,11 @@ async fn process_inbox_new(inbox: &Path, tx_sub: &Sender<Submission>) {
     };
     while let Some(entry) = entries.next_entry().await.ok().flatten() {
         let new_path = entry.path();
-        if !new_path.is_file() {
+        let file_type = match entry.file_type().await {
+            Ok(file_type) => file_type,
+            Err(_) => continue,
+        };
+        if !file_type.is_file() {
             continue;
         }
         let fname = entry.file_name();

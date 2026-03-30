@@ -4253,9 +4253,6 @@ fn codex_inbox_dir() -> PathBuf {
 #[cfg(unix)]
 fn spawn_sigusr1_listener(tx_sub: Sender<Submission>) {
     tokio::spawn(async move {
-        use notify::EventKind;
-        use notify::RecursiveMode;
-        use notify::Watcher;
         use tokio::signal::unix::SignalKind;
 
         let inbox = codex_inbox_dir();
@@ -4272,28 +4269,6 @@ fn spawn_sigusr1_listener(tx_sub: Sender<Submission>) {
             }
         }
 
-        let (notify_tx, mut notify_rx) = tokio::sync::mpsc::channel(32);
-        let mut watcher = match notify::recommended_watcher(move |res| match res {
-            Ok(event) => {
-                if matches!(event.kind, EventKind::Create(_))
-                    && notify_tx.blocking_send(()).is_err()
-                {
-                    warn!("SIGUSR1: inbox watcher channel closed");
-                }
-            }
-            Err(err) => warn!("SIGUSR1: inbox watcher event error: {err}"),
-        }) {
-            Ok(watcher) => watcher,
-            Err(err) => {
-                warn!("SIGUSR1: failed to initialize inbox watcher: {err}");
-                return;
-            }
-        };
-        if let Err(err) = watcher.watch(&inbox.join("new"), RecursiveMode::NonRecursive) {
-            warn!("SIGUSR1: failed to watch inbox/new: {err}");
-            return;
-        }
-
         let mut sigusr1 = match tokio::signal::unix::signal(SignalKind::user_defined1()) {
             Ok(sigusr1) => sigusr1,
             Err(err) => {
@@ -4302,25 +4277,12 @@ fn spawn_sigusr1_listener(tx_sub: Sender<Submission>) {
             }
         };
 
-        process_inbox_new(&inbox, &tx_sub).await;
-
         loop {
-            tokio::select! {
-                maybe_event = notify_rx.recv() => {
-                    let Some(()) = maybe_event else {
-                        warn!("SIGUSR1: inbox watcher channel closed");
-                        return;
-                    };
-                    process_inbox_new(&inbox, &tx_sub).await;
-                }
-                maybe_signal = sigusr1.recv() => {
-                    if maybe_signal.is_none() {
-                        warn!("SIGUSR1: signal stream ended");
-                        return;
-                    }
-                    process_inbox_new(&inbox, &tx_sub).await;
-                }
+            if sigusr1.recv().await.is_none() {
+                warn!("SIGUSR1: signal stream ended");
+                return;
             }
+            process_inbox_new(&inbox, &tx_sub).await;
         }
     });
 }

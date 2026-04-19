@@ -1090,6 +1090,59 @@ async fn reload_user_config_layer_updates_effective_apps_config() {
     assert_eq!(app.destructive_enabled, Some(false));
 }
 
+#[tokio::test]
+async fn reload_user_config_layer_updates_session_model_settings() {
+    let session = make_session_with_config(|config| {
+        config.model = Some("gpt-5".to_string());
+        config.base_instructions = Some("before reload".to_string());
+        config.developer_instructions = Some("before developer".to_string());
+    })
+    .await
+    .expect("create session");
+    let codex_home = session.codex_home().await;
+    std::fs::create_dir_all(&codex_home).expect("create codex home");
+    std::fs::write(
+        codex_home.join(CONFIG_TOML_FILE),
+        r#"
+model = "gpt-5.1"
+model_reasoning_summary = "detailed"
+developer_instructions = "after developer"
+base_instructions = "after reload"
+"#,
+    )
+    .expect("write user config");
+
+    session.reload_user_config_layer().await;
+
+    let config = session.get_config().await;
+    assert_eq!(config.model.as_deref(), Some("gpt-5.1"));
+    assert_eq!(
+        config.model_reasoning_summary,
+        Some(codex_protocol::config_types::ReasoningSummary::Detailed)
+    );
+
+    let state = session.state.lock().await;
+    assert_eq!(
+        state.session_configuration.collaboration_mode.model(),
+        "gpt-5.1"
+    );
+    assert_eq!(
+        state.session_configuration.model_reasoning_summary,
+        Some(codex_protocol::config_types::ReasoningSummary::Detailed)
+    );
+    assert_eq!(
+        state
+            .session_configuration
+            .developer_instructions
+            .as_deref(),
+        Some("after developer")
+    );
+    assert_eq!(
+        state.session_configuration.base_instructions,
+        "after reload"
+    );
+}
+
 #[test]
 fn filter_connectors_for_input_skips_duplicate_slug_mentions() {
     let connectors = vec![
@@ -3167,6 +3220,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         services,
         js_repl,
+        last_sigusr2_reload_generation: AtomicU64::new(0),
         next_internal_sub_id: AtomicU64::new(0),
     };
 
@@ -4130,6 +4184,7 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         services,
         js_repl,
+        last_sigusr2_reload_generation: AtomicU64::new(0),
         next_internal_sub_id: AtomicU64::new(0),
     });
 

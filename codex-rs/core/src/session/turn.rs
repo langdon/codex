@@ -383,6 +383,7 @@ pub(crate) async fn run_turn(
         if run_pending_session_start_hooks(&sess, &turn_context).await {
             break;
         }
+        sess.maybe_reload_config_from_sigusr2().await;
 
         // Note that pending_input would be something like a message the user
         // submitted through the UI while the model was running. Though the UI

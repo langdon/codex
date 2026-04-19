@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(unix)]
+use std::sync::Once;
 
 /// Context for an initialized model agent
 ///
@@ -24,8 +26,12 @@ pub(crate) struct Session {
     pub(crate) guardian_review_session: GuardianReviewSessionManager,
     pub(crate) services: SessionServices,
     pub(super) js_repl: Arc<JsReplHandle>,
+    pub(super) last_sigusr2_reload_generation: AtomicU64,
     pub(super) next_internal_sub_id: AtomicU64,
 }
+
+#[cfg(unix)]
+pub(super) static SIGUSR2_RELOAD_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 pub(crate) struct SessionConfiguration {
@@ -706,8 +712,38 @@ impl Session {
             guardian_review_session: GuardianReviewSessionManager::default(),
             services,
             js_repl,
+            last_sigusr2_reload_generation: AtomicU64::new({
+                #[cfg(unix)]
+                {
+                    SIGUSR2_RELOAD_GENERATION.load(Ordering::Acquire)
+                }
+                #[cfg(not(unix))]
+                {
+                    0
+                }
+            }),
             next_internal_sub_id: AtomicU64::new(0),
         });
+        #[cfg(unix)]
+        {
+            static START_SIGUSR2_RELOAD_LISTENER: Once = Once::new();
+
+            START_SIGUSR2_RELOAD_LISTENER.call_once(|| {
+                tokio::spawn(async move {
+                    use tokio::signal::unix::SignalKind;
+                    use tokio::signal::unix::signal;
+
+                    let Ok(mut signal_stream) = signal(SignalKind::user_defined2()) else {
+                        warn!("failed to register SIGUSR2 handler for config reload");
+                        return;
+                    };
+
+                    while signal_stream.recv().await.is_some() {
+                        SIGUSR2_RELOAD_GENERATION.fetch_add(1, Ordering::AcqRel);
+                    }
+                });
+            });
+        }
         if let Some(network_policy_decider_session) = network_policy_decider_session {
             let mut guard = network_policy_decider_session.write().await;
             *guard = Arc::downgrade(&sess);

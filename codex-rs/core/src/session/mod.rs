@@ -4,6 +4,7 @@ use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
@@ -45,6 +46,7 @@ use codex_config::types::OAuthCredentialsStoreMode;
 use codex_exec_server::Environment;
 use codex_exec_server::EnvironmentManager;
 use codex_exec_server::FileSystemSandboxContext;
+use codex_exec_server::LOCAL_FS;
 use codex_features::FEATURES;
 use codex_features::Feature;
 use codex_features::unstable_features_warning_event;
@@ -147,6 +149,7 @@ use crate::client::ModelClient;
 use crate::codex_thread::ThreadConfigSnapshot;
 use crate::compact::collect_user_messages;
 use crate::config::Config;
+use crate::config::ConfigOverrides;
 use crate::config::Constrained;
 use crate::config::ConstraintResult;
 use crate::config::GhostSnapshotConfig;
@@ -157,6 +160,7 @@ use crate::context_manager::TotalTokenUsageBreakdown;
 use crate::environment_context::EnvironmentContext;
 use crate::thread_rollout_truncation::initial_history_has_prior_user_turns;
 use codex_config::CONFIG_TOML_FILE;
+use codex_config::config_toml::ConfigToml;
 use codex_config::types::McpServerConfig;
 use codex_config::types::ShellEnvironmentPolicy;
 use codex_model_provider_info::ModelProviderInfo;
@@ -1482,14 +1486,154 @@ impl Session {
             }
         };
 
-        let mut state = self.state.lock().await;
-        let mut config = (*state.session_configuration.original_config_do_not_use).clone();
+        let (current_config, previous_model, current_provider) = {
+            let state = self.state.lock().await;
+            (
+                (*state.session_configuration.original_config_do_not_use).clone(),
+                state
+                    .session_configuration
+                    .collaboration_mode
+                    .model()
+                    .to_string(),
+                state.session_configuration.provider.clone(),
+            )
+        };
+        let mut config = current_config.clone();
         config.config_layer_stack = config
             .config_layer_stack
             .with_user_config(&config_toml_path, user_config);
-        state.session_configuration.original_config_do_not_use = Arc::new(config);
+
+        let merged_toml = config.config_layer_stack.effective_config();
+        let explicit_base_instructions = merged_toml
+            .get("base_instructions")
+            .and_then(toml::Value::as_str)
+            .map(ToOwned::to_owned);
+        let config_toml: ConfigToml = match merged_toml.try_into() {
+            Ok(config_toml) => config_toml,
+            Err(err) => {
+                warn!("failed to deserialize merged config while reloading layer: {err}");
+                return;
+            }
+        };
+
+        let reloaded_config = match Config::load_config_with_layer_stack(
+            LOCAL_FS.as_ref(),
+            config_toml,
+            ConfigOverrides {
+                cwd: Some(current_config.cwd.to_path_buf()),
+                codex_self_exe: current_config.codex_self_exe.clone(),
+                codex_linux_sandbox_exe: current_config.codex_linux_sandbox_exe.clone(),
+                main_execve_wrapper_exe: current_config.main_execve_wrapper_exe.clone(),
+                js_repl_node_path: current_config.js_repl_node_path.clone(),
+                js_repl_node_module_dirs: Some(current_config.js_repl_node_module_dirs.clone()),
+                zsh_path: current_config.zsh_path.clone(),
+                ephemeral: Some(current_config.ephemeral),
+                ..ConfigOverrides::default()
+            },
+            current_config.codex_home.clone(),
+            config.config_layer_stack.clone(),
+        )
+        .await
+        {
+            Ok(reloaded_config) => reloaded_config,
+            Err(err) => {
+                warn!("failed to rebuild config while reloading layer: {err}");
+                return;
+            }
+        };
+
+        let next_model = reloaded_config
+            .model
+            .clone()
+            .unwrap_or_else(|| previous_model.clone());
+        let next_base_instructions = if let Some(base_instructions) = reloaded_config
+            .base_instructions
+            .clone()
+            .or(explicit_base_instructions)
+        {
+            base_instructions
+        } else {
+            let model_info = self
+                .services
+                .models_manager
+                .get_model_info(
+                    next_model.as_str(),
+                    &reloaded_config.to_models_manager_config(),
+                )
+                .await;
+            model_info.get_model_instructions(reloaded_config.personality)
+        };
+
+        let mut state = self.state.lock().await;
+        if current_provider != reloaded_config.model_provider {
+            warn!(
+                "SIGUSR2 config reload ignored model provider change for active session (restart required)"
+            );
+        }
+        state.session_configuration.collaboration_mode =
+            state.session_configuration.collaboration_mode.with_updates(
+                Some(next_model.clone()),
+                Some(reloaded_config.model_reasoning_effort),
+                /*developer_instructions*/ None,
+            );
+        state.session_configuration.model_reasoning_summary =
+            reloaded_config.model_reasoning_summary;
+        state.session_configuration.service_tier = reloaded_config.service_tier;
+        state.session_configuration.developer_instructions =
+            reloaded_config.developer_instructions.clone();
+        state.session_configuration.personality = reloaded_config.personality;
+        state.session_configuration.compact_prompt = reloaded_config.compact_prompt.clone();
+        state.session_configuration.approvals_reviewer = reloaded_config.approvals_reviewer;
+        state.session_configuration.base_instructions = next_base_instructions;
+
         self.services.skills_manager.clear_cache();
         self.services.plugins_manager.clear_cache();
+        state.session_configuration.original_config_do_not_use = Arc::new(reloaded_config.clone());
+
+        if state.session_configuration.approval_policy.value()
+            != reloaded_config.permissions.approval_policy.value()
+        {
+            warn!(
+                "SIGUSR2 config reload ignored approval policy change for active session (restart required)"
+            );
+        }
+        if state.session_configuration.sandbox_policy.get()
+            != reloaded_config.permissions.sandbox_policy.get()
+        {
+            warn!(
+                "SIGUSR2 config reload ignored sandbox policy change for active session (restart required)"
+            );
+        }
+        if state.session_configuration.cwd.as_path() != reloaded_config.cwd.as_path() {
+            warn!("SIGUSR2 config reload ignored cwd change for active session (restart required)");
+        }
+    }
+
+    async fn maybe_reload_config_from_sigusr2(&self) {
+        #[cfg(unix)]
+        let reload_generation = session::SIGUSR2_RELOAD_GENERATION.load(Ordering::Acquire);
+        #[cfg(not(unix))]
+        let reload_generation = 0;
+        let previous_generation = self
+            .last_sigusr2_reload_generation
+            .swap(reload_generation, Ordering::AcqRel);
+        if reload_generation == previous_generation {
+            return;
+        }
+
+        self.reload_user_config_layer().await;
+        let config_layer_stack = {
+            let state = self.state.lock().await;
+            state
+                .session_configuration
+                .original_config_do_not_use
+                .config_layer_stack
+                .clone()
+        };
+        if let Err(err) = self.services.exec_policy.reload(&config_layer_stack).await {
+            warn!("failed to reload rules from SIGUSR2: {err}");
+        }
+        info!("[config reloaded]");
     }
 
     async fn build_settings_update_items(

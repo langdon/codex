@@ -205,6 +205,14 @@ const forwardSignal = (signal) => {
   process.on(sig, () => forwardSignal(sig));
 });
 
+// SIGHUP is already used to forward terminal hangups to the child.
+// SIGUSR2 is reserved for live config/rules reload.
+if (process.platform !== "win32") {
+  process.on("SIGUSR2", () => {
+    forwardSignal("SIGUSR2");
+  });
+}
+
 // When the child exits, mirror its termination reason in the parent so that
 // shell scripts and other tooling observe the correct exit status.
 // Wrap the lifetime of the child process in a Promise so that we can await
